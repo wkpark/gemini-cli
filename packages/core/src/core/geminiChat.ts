@@ -39,6 +39,7 @@ import {
 import {
   ChatRecordingService,
   type ResumedSessionData,
+  type MessageRecord,
 } from '../services/chatRecordingService.js';
 import {
   ContentRetryEvent,
@@ -48,6 +49,8 @@ import {
 } from '../telemetry/types.js';
 import { handleFallback } from '../fallback/handler.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
+import { isStringProperty, hasProperty } from '../utils/checks.js';
+import { randomUUID } from 'node:crypto';
 import { scrubHistory } from '../utils/historyHardening.js';
 import { partListUnionToString } from './geminiRequest.js';
 import type { ModelConfigKey } from '../services/modelConfigService.js';
@@ -797,10 +800,65 @@ export class GeminiChat {
     history: readonly Content[],
     options: { silent?: boolean } = {},
   ): void {
+    const oldHistory = this.agentHistory.get();
+    // If the new history is shorter than the old one, it's likely a compression or major edit.
+    // In this case, record a snapshot to ensure resumed sessions start from the new state.
+    const isMajorChange = history.length < oldHistory.length;
+
     this.agentHistory.set(history, options);
     this.lastPromptTokenCount = estimateTokenCountSync(
       this.agentHistory.flatMap((c) => c.parts || []),
     );
+
+    if (isMajorChange) {
+      const snapshotMessages: MessageRecord[] = history.map((content) => {
+        const contentStr = partListUnionToString(content.parts || []);
+        const isShell =
+          content.role === 'user' && contentStr.startsWith('Output of ');
+
+        const thoughts: Array<{
+          subject: string;
+          description: string;
+          timestamp: string;
+        }> = [];
+        if (content.parts) {
+          for (const p of content.parts) {
+            const pObj: unknown = p;
+            if (isStringProperty(pObj, 'thought')) {
+              thoughts.push({
+                subject: 'Thought',
+                description: pObj.thought,
+                timestamp: new Date().toISOString(),
+              });
+            } else if (
+              hasProperty(pObj, 'thought') &&
+              pObj.thought === true &&
+              isStringProperty(pObj, 'text')
+            ) {
+              thoughts.push({
+                subject: 'Thought',
+                description: pObj.text,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        }
+
+        return {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          type:
+            content.role === 'user'
+              ? isShell
+                ? 'user_shell'
+                : 'user'
+              : 'gemini',
+          content: content.parts || [],
+          thoughts: thoughts.length > 0 ? thoughts : undefined,
+        } as MessageRecord;
+      });
+      this.chatRecordingService.recordSnapshot(snapshotMessages);
+    }
     this.chatRecordingService.updateMessagesFromHistory(history);
   }
 

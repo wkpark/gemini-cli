@@ -81,6 +81,8 @@ describe('useQuotaAndFallback', () => {
 
     mockHistoryManager = {
       addItem: vi.fn(),
+      addItemsBatch: vi.fn(),
+      pruneHistory: vi.fn(),
       history: [],
       updateItem: vi.fn(),
       clearItems: vi.fn(),

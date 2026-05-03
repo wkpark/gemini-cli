@@ -71,7 +71,7 @@ export interface ToolCallRecord {
  */
 export type ConversationRecordExtra =
   | {
-      type: 'user' | 'info' | 'error' | 'warning';
+      type: 'user' | 'user_shell' | 'info' | 'error' | 'warning';
     }
   | {
       type: 'gemini';
@@ -122,6 +122,11 @@ export interface LoadConversationOptions {
 
 export interface RewindRecord {
   $rewindTo: string;
+}
+
+export interface SnapshotRecord {
+  $snapshot: true;
+  messages: MessageRecord[];
 }
 
 export interface MetadataUpdateRecord {

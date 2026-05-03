@@ -12,6 +12,7 @@ import { Text, useIsScreenReaderEnabled, type DOMElement } from 'ink';
 import { App } from './App.js';
 import { type UIState } from './contexts/UIStateContext.js';
 import { StreamingState } from './types.js';
+import { type UseHistoryManagerReturn } from './hooks/useHistoryManager.js';
 import { makeFakeConfig, CoreToolCallStatus } from '@google/gemini-cli-core';
 
 vi.mock('ink', async (importOriginal) => {
@@ -76,11 +77,13 @@ describe('App', () => {
     } as unknown as React.MutableRefObject<DOMElement | null>,
     historyManager: {
       addItem: vi.fn(),
+      addItemsBatch: vi.fn(),
+      pruneHistory: vi.fn(),
       history: [],
       updateItem: vi.fn(),
       clearItems: vi.fn(),
       loadHistory: vi.fn(),
-    },
+    } as unknown as UseHistoryManagerReturn,
     history: [],
     pendingHistoryItems: [],
     pendingGeminiHistoryItems: [],

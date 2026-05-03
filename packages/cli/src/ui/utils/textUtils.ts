@@ -166,6 +166,9 @@ export function sanitizeForDisplay(str: string, maxLength?: number): string {
  * Normalizes escaped newline characters (e.g., "\\n") into actual newline characters.
  */
 export function normalizeEscapedNewlines(value: string): string {
+  if (typeof value !== 'string') {
+    return '';
+  }
   return value.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
 }
 
