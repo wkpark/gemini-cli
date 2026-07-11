@@ -599,6 +599,9 @@ export function convertSessionToHistoryFormats(
         case 'user':
           messageType = MessageType.USER;
           break;
+        case 'user_shell':
+          messageType = MessageType.USER_SHELL;
+          break;
         case 'info':
           messageType = MessageType.INFO;
           break;

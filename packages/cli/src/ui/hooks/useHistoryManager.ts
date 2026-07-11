@@ -24,6 +24,11 @@ export interface UseHistoryManagerReturn {
     id: number,
     updates: Partial<Omit<HistoryItem, 'id'>> | HistoryItemUpdater,
   ) => void;
+  addItemsBatch: (
+    itemsData: Array<Omit<HistoryItem, 'id'>>,
+    isResuming?: boolean,
+  ) => void;
+  pruneHistory: (count: number) => void;
   clearItems: () => void;
   loadHistory: (newHistory: HistoryItem[]) => void;
 }
@@ -129,6 +134,85 @@ export function useHistory({
   );
 
   /**
+   * Adds multiple items to the history state in a single update.
+   */
+  const addItemsBatch = useCallback(
+    (
+      itemsData: Array<Omit<HistoryItem, 'id'>>,
+      isResuming: boolean = false,
+    ) => {
+      if (itemsData.length === 0) return;
+
+      setHistory((prevHistory) => {
+        const finalItems = [...prevHistory];
+        const now = Date.now();
+
+        for (let i = 0; i < itemsData.length; i++) {
+          const itemData = itemsData[i];
+          const id = getNextMessageId(isResuming ? i : now);
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          const newItem = { ...itemData, id } as HistoryItem;
+
+          if (finalItems.length > 0) {
+            const lastItem = finalItems[finalItems.length - 1];
+            if (
+              lastItem.type === 'user' &&
+              newItem.type === 'user' &&
+              lastItem.text === newItem.text
+            ) {
+              continue; // Don't add the duplicate
+            }
+          }
+          finalItems.push(newItem);
+        }
+        return finalItems;
+      });
+
+      if (!isResuming && chatRecordingService) {
+        for (const itemData of itemsData) {
+          switch (itemData.type) {
+            case 'compression':
+            case 'info':
+              chatRecordingService?.recordMessage({
+                model: undefined,
+                type: 'info',
+                content: itemData.text ?? '',
+              });
+              break;
+            case 'warning':
+              chatRecordingService?.recordMessage({
+                model: undefined,
+                type: 'warning',
+                content: itemData.text ?? '',
+              });
+              break;
+            case 'error':
+              chatRecordingService?.recordMessage({
+                model: undefined,
+                type: 'error',
+                content: itemData.text ?? '',
+              });
+              break;
+            default:
+              break;
+          }
+        }
+      }
+    },
+    [getNextMessageId, chatRecordingService],
+  );
+
+  /**
+   * Prunes the oldest N items from the history.
+   */
+  const pruneHistory = useCallback((count: number) => {
+    setHistory((prevHistory) => {
+      if (prevHistory.length <= count) return [];
+      return prevHistory.slice(count);
+    });
+  }, []);
+
+  /**
    * Updates an existing history item identified by its ID.
    * @deprecated Prefer not to update history item directly as we are currently
    * rendering all history items in <Static /> for performance reasons. Only use
@@ -167,9 +251,19 @@ export function useHistory({
       history,
       addItem,
       updateItem,
+      addItemsBatch,
+      pruneHistory,
       clearItems,
       loadHistory,
     }),
-    [history, addItem, updateItem, clearItems, loadHistory],
+    [
+      history,
+      addItem,
+      updateItem,
+      addItemsBatch,
+      pruneHistory,
+      clearItems,
+      loadHistory,
+    ],
   );
 }

@@ -431,6 +431,7 @@ export enum MessageType {
   ERROR = 'error',
   WARNING = 'warning',
   USER = 'user',
+  USER_SHELL = 'user_shell',
   ABOUT = 'about',
   HELP = 'help',
   STATS = 'stats',

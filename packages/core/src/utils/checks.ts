@@ -26,3 +26,41 @@ export function checkExhaustive(
   assumeExhaustive(value);
   throw new Error(msg);
 }
+
+/**
+ * Safely checks if an object has a property.
+ */
+export function hasProperty<T extends string>(
+  obj: unknown,
+  prop: T,
+): obj is { [key in T]: unknown } {
+  return (
+    obj !== null &&
+    typeof obj === 'object' &&
+    Object.prototype.hasOwnProperty.call(obj, prop)
+  );
+}
+
+/**
+ * Safely checks if an object has a string property.
+ */
+export function isStringProperty<T extends string>(
+  obj: unknown,
+  prop: T,
+): obj is { [key in T]: string } {
+  return hasProperty(obj, prop) && typeof obj[prop] === 'string';
+}
+
+/**
+ * Safely checks if an object has an object property.
+ */
+export function isObjectProperty<T extends string>(
+  obj: unknown,
+  prop: T,
+): obj is { [key in T]: object } {
+  return (
+    hasProperty(obj, prop) &&
+    obj[prop] !== null &&
+    typeof obj[prop] === 'object'
+  );
+}

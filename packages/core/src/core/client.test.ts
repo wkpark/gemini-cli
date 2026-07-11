@@ -461,6 +461,7 @@ describe('Gemini Client (client.ts)', () => {
         setHistory: vi.fn(),
         getLastPromptTokenCount: vi.fn().mockReturnValue(originalTokenCount),
         getChatRecordingService: vi.fn().mockReturnValue({
+          recordSnapshot: vi.fn(),
           getConversation: vi.fn().mockReturnValue(null),
           getConversationFilePath: vi.fn().mockReturnValue(null),
         }),
@@ -695,6 +696,7 @@ describe('Gemini Client (client.ts)', () => {
 
       // Override the mock to return values
       const mockRecordingService = {
+        recordSnapshot: vi.fn(),
         getConversation: vi.fn().mockReturnValue(mockConversation),
         getConversationFilePath: vi.fn().mockReturnValue(mockFilePath),
       };
@@ -1628,6 +1630,7 @@ ${JSON.stringify(
         addHistory: vi.fn(),
         setTools: vi.fn(),
         getChatRecordingService: vi.fn().mockReturnValue({
+          recordSnapshot: vi.fn(),
           getConversation: vi.fn(),
           getConversationFilePath: vi.fn(),
         }),
@@ -1641,6 +1644,7 @@ ${JSON.stringify(
         addHistory: vi.fn(),
         setTools: vi.fn(),
         getChatRecordingService: vi.fn().mockReturnValue({
+          recordSnapshot: vi.fn(),
           getConversation: vi.fn(),
           getConversationFilePath: vi.fn(),
         }),

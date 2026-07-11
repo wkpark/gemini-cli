@@ -13,6 +13,7 @@ import {
   type GenerateContentResponse,
 } from '@google/genai';
 import { partListUnionToString } from './geminiRequest.js';
+import { randomUUID } from 'node:crypto';
 import {
   getDirectoryContextString,
   getInitialChatHistory,
@@ -40,6 +41,7 @@ import { tokenLimit } from './tokenLimits.js';
 import type {
   ChatRecordingService,
   ResumedSessionData,
+  MessageRecord,
 } from '../services/chatRecordingService.js';
 import type { ContentGenerator } from './contentGenerator.js';
 import { LoopDetectionService } from '../services/loopDetectionService.js';
@@ -66,6 +68,7 @@ import {
   createAvailabilityContextProvider,
 } from '../availability/policyHelpers.js';
 import { getDisplayString, resolveModel } from '../config/models.js';
+import { isStringProperty, hasProperty } from '../utils/checks.js';
 import { partToString } from '../utils/partUtils.js';
 import {
   coreEvents,
@@ -1198,6 +1201,58 @@ export class GeminiClient {
         if (conversation && filePath) {
           resumedData = { conversation, filePath };
         }
+
+        // PERF: Record an atomic snapshot of the compressed history.
+        // This ensures the summary and preserved messages are persisted
+        // in a single, efficient JSONL record that avoids UI interference.
+        const snapshotMessages: MessageRecord[] = newHistory.map((content) => {
+          const contentStr = partListUnionToString(content.parts || []);
+          const isShell =
+            content.role === 'user' && contentStr.startsWith('Output of ');
+
+          // Extract thoughts if present in parts
+          const thoughts: Array<{
+            subject: string;
+            description: string;
+            timestamp: string;
+          }> = [];
+          if (content.parts) {
+            for (const p of content.parts) {
+              const pObj: unknown = p;
+              if (isStringProperty(pObj, 'thought')) {
+                thoughts.push({
+                  subject: 'Thought',
+                  description: pObj.thought,
+                  timestamp: new Date().toISOString(),
+                });
+              } else if (
+                hasProperty(pObj, 'thought') &&
+                pObj.thought === true &&
+                isStringProperty(pObj, 'text')
+              ) {
+                thoughts.push({
+                  subject: 'Thought',
+                  description: pObj.text,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            }
+          }
+
+          return {
+            id: randomUUID(),
+            timestamp: new Date().toISOString(),
+            type:
+              content.role === 'user'
+                ? isShell
+                  ? 'user_shell'
+                  : 'user'
+                : 'gemini',
+            content: content.parts || [],
+            thoughts: thoughts.length > 0 ? thoughts : undefined,
+          } as MessageRecord;
+        });
+        currentRecordingService.recordSnapshot(snapshotMessages);
 
         this.chat = await this.startChat(newHistory, resumedData);
         this.updateTelemetryTokenCount();

@@ -4,6 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {
+  hasProperty,
+  isStringProperty,
+  isObjectProperty,
+} from '../utils/checks.js';
 import { type ThoughtSummary } from '../utils/thoughtUtils.js';
 import { getProjectHash } from '../utils/paths.js';
 import path from 'node:path';
@@ -14,7 +19,6 @@ import {
   deleteSessionArtifactsAsync,
   deleteSubagentSessionDirAndArtifactsAsync,
 } from '../utils/sessionOperations.js';
-import readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type {
   Content,
@@ -34,6 +38,7 @@ import {
   type ResumedSessionData,
   type LoadConversationOptions,
   type RewindRecord,
+  type SnapshotRecord,
   type MetadataUpdateRecord,
   type PartialMetadataRecord,
 } from './chatRecordingTypes.js';
@@ -47,37 +52,21 @@ const ENOSPC_WARNING_MESSAGE =
   'The conversation will continue but will not be saved to disk. ' +
   'Free up disk space and restart to enable recording.';
 
-function hasProperty<T extends string>(
-  obj: unknown,
-  prop: T,
-): obj is { [key in T]: unknown } {
-  return obj !== null && typeof obj === 'object' && prop in obj;
-}
-
-function isStringProperty<T extends string>(
-  obj: unknown,
-  prop: T,
-): obj is { [key in T]: string } {
-  return hasProperty(obj, prop) && typeof obj[prop] === 'string';
-}
-
-function isObjectProperty<T extends string>(
-  obj: unknown,
-  prop: T,
-): obj is { [key in T]: object } {
-  return (
-    hasProperty(obj, prop) &&
-    obj[prop] !== null &&
-    typeof obj[prop] === 'object'
-  );
-}
-
 function isRewindRecord(record: unknown): record is RewindRecord {
   return isStringProperty(record, '$rewindTo');
 }
 
+function isSnapshotRecord(record: unknown): record is SnapshotRecord {
+  return (
+    hasProperty(record, '$snapshot') &&
+    record.$snapshot === true &&
+    hasProperty(record, 'messages') &&
+    Array.isArray(record.messages)
+  );
+}
+
 function isMessageRecord(record: unknown): record is MessageRecord {
-  return isStringProperty(record, 'id');
+  return isStringProperty(record, 'id') && hasProperty(record, 'type');
 }
 
 function isMetadataUpdateRecord(
@@ -89,10 +78,7 @@ function isMetadataUpdateRecord(
 function isPartialMetadataRecord(
   record: unknown,
 ): record is PartialMetadataRecord {
-  return (
-    isStringProperty(record, 'sessionId') &&
-    isStringProperty(record, 'projectHash')
-  );
+  return isStringProperty(record, 'sessionId') && isStringProperty(record, 'projectHash');
 }
 
 function isTextPart(part: unknown): part is { text: string } {
@@ -121,44 +107,102 @@ export async function loadConversationRecord(
   }
 
   try {
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity,
-    });
+    const fileContent = fs.readFileSync(filePath, 'utf8');
+    const lines = fileContent.split('\n');
 
     let metadata: Partial<ConversationRecord> = {};
     const messagesMap = new Map<string, MessageRecord>();
-    const messageIds: string[] = [];
-    const messageKinds = new Map<
-      string,
-      { isUser: boolean; isUserOrAssistant: boolean }
-    >();
+    const uniqueMessageIds = new Set<string>();
     let isTrackingMemoryScratchpadFreshness = false;
     let memoryScratchpadIsStale = false;
     let firstUserMessageStr: string | undefined;
 
-    for await (const line of rl) {
-      if (!line.trim()) continue;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
       try {
-        const record = JSON.parse(line) as unknown;
-        if (isRewindRecord(record)) {
-          if (isTrackingMemoryScratchpadFreshness) {
-            memoryScratchpadIsStale = true;
-          }
-          const rewindId = record.$rewindTo;
-          if (options?.metadataOnly) {
-            const idx = messageIds.indexOf(rewindId);
-            if (idx !== -1) {
-              const removedIds = messageIds.splice(idx);
-              for (const removedId of removedIds) {
-                messageKinds.delete(removedId);
+        // 1. FAST PATH for session browser metadata (very aggressive)
+        if (options?.metadataOnly && trimmed.startsWith('{"id":')) {
+          const idMatch = /^\{"id":"([^"]+)"/.exec(trimmed);
+          if (idMatch) {
+            const msgId = idMatch[1];
+            if (!uniqueMessageIds.has(msgId)) {
+              uniqueMessageIds.add(msgId);
+              if (!firstUserMessageStr) {
+                const typeMatch = /"type"\s*:\s*"(user|user_shell)"/.exec(
+                  trimmed,
+                );
+                if (typeMatch) {
+                  try {
+                    const record = JSON.parse(trimmed) as unknown;
+                    if (isMessageRecord(record) && record.content) {
+                      if (Array.isArray(record.content)) {
+                        firstUserMessageStr = record.content
+                          .map((p) => (isTextPart(p) ? p.text : ''))
+                          .join('');
+                      } else if (typeof record.content === 'string') {
+                        firstUserMessageStr = record.content;
+                      }
+                    }
+                  } catch {
+                    /* ignore */
+                  }
+                }
               }
-            } else {
-              messageIds.length = 0;
-              messageKinds.clear();
             }
-          } else {
+          }
+          continue;
+        }
+
+        // 2. Metadata / Control Record Detection
+        if (
+          trimmed.includes('"sessionId"') &&
+          trimmed.includes('"projectHash"')
+        ) {
+          try {
+            const record = JSON.parse(trimmed) as unknown;
+            if (isPartialMetadataRecord(record)) {
+              metadata = { ...metadata, ...record };
+              continue;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+
+        // 3. Regular Record Parsing
+        const record = JSON.parse(trimmed) as unknown;
+        if (isSnapshotRecord(record)) {
+          const snapshot = record;
+          // SAFETY: Only clear if snapshot actually has messages.
+          if (
+            !options?.metadataOnly &&
+            snapshot.messages &&
+            snapshot.messages.length > 0
+          ) {
+            messagesMap.clear();
+          }
+          for (const msg of snapshot.messages) {
+            uniqueMessageIds.add(msg.id);
+            if (!options?.metadataOnly) messagesMap.set(msg.id, msg);
+            const isUser = msg.type === 'user' || msg.type === 'user_shell';
+            if (!firstUserMessageStr && isUser && msg.content) {
+              if (Array.isArray(msg.content)) {
+                firstUserMessageStr = msg.content
+                  .map((p) => (isTextPart(p) ? p.text : ''))
+                  .join('');
+              } else if (typeof msg.content === 'string') {
+                firstUserMessageStr = msg.content;
+              }
+            }
+          }
+          memoryScratchpadIsStale = false;
+        } else if (isRewindRecord(record)) {
+          if (isTrackingMemoryScratchpadFreshness)
+            memoryScratchpadIsStale = true;
+          const rewindId = record.$rewindTo;
+          if (!options?.metadataOnly) {
             let found = false;
             const idsToDelete: string[] = [];
             for (const [id] of messagesMap) {
@@ -166,46 +210,26 @@ export async function loadConversationRecord(
               if (found) idsToDelete.push(id);
             }
             if (found) {
-              for (const id of idsToDelete) {
-                messagesMap.delete(id);
-              }
+              for (const id of idsToDelete) messagesMap.delete(id);
             } else {
               messagesMap.clear();
             }
           }
         } else if (isMessageRecord(record)) {
-          if (isTrackingMemoryScratchpadFreshness) {
-            memoryScratchpadIsStale = true;
-          }
-          const id = record.id;
-          const isUser = hasProperty(record, 'type') && record.type === 'user';
-          const isUserOrAssistant =
-            hasProperty(record, 'type') &&
-            (record.type === 'user' || record.type === 'gemini');
-          // Track message count and first user message
-          if (options?.metadataOnly) {
-            messageIds.push(id);
-            messageKinds.set(id, { isUser, isUserOrAssistant });
-          }
-          if (
-            !firstUserMessageStr &&
-            isUser &&
-            hasProperty(record, 'content') &&
-            record['content']
-          ) {
-            // Basic extraction of first user message for display
-            const rawContent = record['content'];
-            if (Array.isArray(rawContent)) {
-              firstUserMessageStr = rawContent
-                .map((p: unknown) => (isTextPart(p) ? p['text'] : ''))
+          memoryScratchpadIsStale = true;
+          uniqueMessageIds.add(record.id);
+          const isUser = record.type === 'user' || record.type === 'user_shell';
+          if (!firstUserMessageStr && isUser && record.content) {
+            if (Array.isArray(record.content)) {
+              firstUserMessageStr = record.content
+                .map((p) => (isTextPart(p) ? p.text : ''))
                 .join('');
-            } else if (typeof rawContent === 'string') {
-              firstUserMessageStr = rawContent;
+            } else if (typeof record.content === 'string') {
+              firstUserMessageStr = record.content;
             }
           }
-
           if (!options?.metadataOnly) {
-            messagesMap.set(id, record);
+            messagesMap.set(record.id, record);
             if (
               options?.maxMessages &&
               messagesMap.size > options.maxMessages
@@ -221,17 +245,12 @@ export async function loadConversationRecord(
             );
             memoryScratchpadIsStale = false;
           }
-          // Metadata update
-          metadata = {
-            ...metadata,
-            ...record.$set,
-          };
+          metadata = { ...metadata, ...record.$set };
         } else if (isPartialMetadataRecord(record)) {
-          // Initial metadata line
           metadata = { ...metadata, ...record };
         }
       } catch {
-        // ignore parse errors on individual lines
+        /* ignore parse errors */
       }
     }
 
@@ -239,32 +258,16 @@ export async function loadConversationRecord(
       return await parseLegacyRecordFallback(filePath, options);
     }
 
-    const metadataMessages = Array.isArray(metadata.messages)
-      ? metadata.messages
-      : [];
-    const loadedMessages =
-      metadataMessages.length > 0
-        ? metadataMessages
-        : Array.from(messagesMap.values());
-    const metadataFirstUserMessage =
-      metadataMessages.find((message) => message.type === 'user') ?? null;
-    let fallbackFirstUserMessage = firstUserMessageStr;
-    if (!fallbackFirstUserMessage && metadataFirstUserMessage) {
-      const rawContent = metadataFirstUserMessage.content;
-      if (Array.isArray(rawContent)) {
-        fallbackFirstUserMessage = rawContent
-          .map((part: unknown) => (isTextPart(part) ? part['text'] : ''))
-          .join('');
-      } else if (typeof rawContent === 'string') {
-        fallbackFirstUserMessage = rawContent;
-      }
-    }
-    const userMessageCount = options?.metadataOnly
-      ? Array.from(messageKinds.values()).filter((m) => m.isUser).length
-      : loadedMessages.filter((m) => m.type === 'user').length;
+    const loadedMessages = Array.from(messagesMap.values());
+    const userMessageCount = loadedMessages.filter(
+      (m) => m.type === 'user' || m.type === 'user_shell',
+    ).length;
     const hasUserOrAssistant = options?.metadataOnly
-      ? Array.from(messageKinds.values()).some((m) => m.isUserOrAssistant)
-      : loadedMessages.some((m) => m.type === 'user' || m.type === 'gemini');
+      ? true
+      : loadedMessages.some(
+          (m) =>
+            m.type === 'user' || m.type === 'user_shell' || m.type === 'gemini',
+        );
 
     return {
       sessionId: metadata.sessionId,
@@ -275,27 +278,17 @@ export async function loadConversationRecord(
       memoryScratchpad: metadata.memoryScratchpad,
       directories: metadata.directories,
       kind: metadata.kind,
-      messages: options?.metadataOnly ? [] : loadedMessages,
-      messageCount: options?.metadataOnly
-        ? metadataMessages.length || messageIds.length
-        : loadedMessages.length,
-      userMessageCount:
-        options?.metadataOnly && metadataMessages.length > 0
-          ? metadataMessages.filter((m) => m.type === 'user').length
-          : userMessageCount,
+      messages: loadedMessages,
+      messageCount: uniqueMessageIds.size,
+      userMessageCount,
+      hasUserOrAssistantMessage: hasUserOrAssistant,
+      firstUserMessage: firstUserMessageStr,
       memoryScratchpadIsStale: isTrackingMemoryScratchpadFreshness
         ? memoryScratchpadIsStale
         : undefined,
-      firstUserMessage: fallbackFirstUserMessage,
-      hasUserOrAssistantMessage:
-        options?.metadataOnly && metadataMessages.length > 0
-          ? metadataMessages.some(
-              (m) => m.type === 'user' || m.type === 'gemini',
-            )
-          : hasUserOrAssistant,
     };
   } catch (error) {
-    debugLogger.error('Error loading conversation record from JSONL:', error);
+    debugLogger.error('Error loading conversation record:', error);
     return null;
   }
 }
@@ -335,28 +328,35 @@ export class ChatRecordingService {
           this.projectHash = this.cachedConversation.projectHash;
 
           if (this.conversationFile.endsWith('.json')) {
-            this.conversationFile = this.conversationFile + 'l'; // e.g. session-foo.jsonl
+            // SAFETY: Never migrate an empty session to prevent accidental data loss.
+            if (this.cachedConversation.messages.length === 0) {
+              debugLogger.warn(
+                'Skipping migration of empty .json session to prevent data loss.',
+              );
+            } else {
+              this.conversationFile = this.conversationFile + 'l'; // e.g. session-foo.jsonl
 
-            // Migrate the entire legacy record to the new file
-            const initialMetadata = {
-              sessionId: this.sessionId,
-              projectHash: this.projectHash,
-              startTime: this.cachedConversation.startTime,
-              lastUpdated: this.cachedConversation.lastUpdated,
-              kind: this.cachedConversation.kind,
-              directories: this.cachedConversation.directories,
-              summary: this.cachedConversation.summary,
-            };
-            this.appendRecord(initialMetadata);
-            for (const msg of this.cachedConversation.messages) {
-              this.appendRecord(msg);
-            }
-            if (this.cachedConversation.memoryScratchpad) {
-              this.appendRecord({
-                $set: {
-                  memoryScratchpad: this.cachedConversation.memoryScratchpad,
-                },
-              });
+              // Migrate the entire legacy record to the new file
+              const initialMetadata = {
+                sessionId: this.sessionId,
+                projectHash: this.projectHash,
+                startTime: this.cachedConversation.startTime,
+                lastUpdated: this.cachedConversation.lastUpdated,
+                kind: this.cachedConversation.kind,
+                directories: this.cachedConversation.directories,
+                summary: this.cachedConversation.summary,
+              };
+              this.appendRecord(initialMetadata);
+              for (const msg of this.cachedConversation.messages) {
+                this.appendRecord(msg);
+              }
+              if (this.cachedConversation.memoryScratchpad) {
+                this.appendRecord({
+                  $set: {
+                    memoryScratchpad: this.cachedConversation.memoryScratchpad,
+                  },
+                });
+              }
             }
           }
 
@@ -448,6 +448,19 @@ export class ChatRecordingService {
     }
   }
 
+  /**
+   * Records a snapshot of the conversation state.
+   * This marks a clean starting point (e.g., after compression) and
+   * contains the full set of messages that should be active from this point.
+   */
+  recordSnapshot(messages: MessageRecord[]): void {
+    if (!this.conversationFile || !this.cachedConversation) {
+      return;
+    }
+    this.cachedConversation.messages = [...messages];
+    this.appendRecord({ $snapshot: true, messages });
+  }
+
   private appendRecord(record: unknown): void {
     if (!this.conversationFile) return;
     try {
@@ -466,6 +479,25 @@ export class ChatRecordingService {
 
   private updateMetadata(updates: Partial<ConversationRecord>): void {
     if (!this.cachedConversation) return;
+
+    // PERF: Skip recording if the updates don't actually change anything.
+    const changedFields = Object.entries(updates).filter(([key, value]) => {
+      const isKeyOfConversation = (
+        k: string,
+      ): k is keyof typeof this.cachedConversation =>
+        k in this.cachedConversation!;
+
+      if (isKeyOfConversation(key)) {
+        const current = this.cachedConversation![key];
+        return JSON.stringify(current) !== JSON.stringify(value);
+      }
+      return true;
+    });
+
+    if (changedFields.length === 0) {
+      return;
+    }
+
     Object.assign(this.cachedConversation, updates);
     this.appendRecord({ $set: updates });
   }
@@ -573,6 +605,10 @@ export class ChatRecordingService {
       );
       throw error;
     }
+  }
+
+  recordMessageUsage(usage: GenerateContentResponseUsageMetadata): void {
+    this.recordMessageTokens(usage);
   }
 
   recordToolCalls(model: string, toolCalls: ToolCallRecord[]): void {
@@ -808,7 +844,14 @@ export class ChatRecordingService {
     } finally {
       // ALWAYS try to delete the session file itself
       try {
-        await fs.promises.unlink(filePath);
+        // SAFETY: Never physically delete session files. Move to .bak instead for recovery.
+        debugLogger.warn(
+          `[SAFETY] Moving session file to .bak instead of deleting: ${filePath}`,
+        );
+        await fs.promises.rename(filePath, `${filePath}.bak`).catch(() =>
+          // Fallback to delete only if rename fails and it's absolutely necessary
+          fs.promises.unlink(filePath).catch(() => {}),
+        );
       } catch (error) {
         if (isNodeError(error) && error.code !== 'ENOENT') {
           debugLogger.error(`Error unlinking session file ${file}:`, error);
@@ -830,10 +873,15 @@ export class ChatRecordingService {
     try {
       const tempDir = this.context.config.storage.getProjectTempDir();
 
-      // Delete the conversation file directly using the tracked path.
-      await fs.promises.unlink(this.conversationFile).catch(() => {
-        // File may not exist; ignore.
-      });
+      // SAFETY: Never physically delete current session file. Move to .bak instead.
+      debugLogger.warn(
+        `[SAFETY] Moving current session file to .bak instead of deleting: ${this.conversationFile}`,
+      );
+      await fs.promises
+        .rename(this.conversationFile, `${this.conversationFile}.bak`)
+        .catch(() => {
+          // File may not exist; ignore.
+        });
 
       // Delegate tool-output and log cleanup to the shared utility.
       await deleteSessionArtifactsAsync(this.sessionId, tempDir);
